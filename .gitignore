@@ -1,0 +1,13 @@
+
+# Ignore cache files and directories
+.ipynb_checkpoints/
+*.pyc
+__pycache__/
+
+# Ignore data files
+data/
+perso/
+
+# Ignore output files
+output/
+
