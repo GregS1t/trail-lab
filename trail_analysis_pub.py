@@ -4,7 +4,7 @@ Usage in a notebook:
     from trail_analysis_pub import *
 
 
-    
+
 """
 
 import io
@@ -520,4 +520,318 @@ def plot_walk_by_slope_sections(df, slope_bins, slope_labels,
               loc="upper left", fontsize=8)
     plt.tight_layout()
     plt.show()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ERA5-Land via openmeteo-requests SDK (FlatBuffers)
+# ─────────────────────────────────────────────────────────────────────────────
+
+try:
+    import openmeteo_requests
+    _OPENMETEO_AVAILABLE = True
+except ImportError:
+    _OPENMETEO_AVAILABLE = False
+    warnings.warn(
+        "openmeteo-requests non installé. "
+        "Installer avec : pip install openmeteo-requests\n"
+        "Les fonctions météo seront indisponibles.",
+        ImportWarning,
+        stacklevel=2,
+    )
+
+# Variables horaires demandées à ERA5-Land (ordre fixe pour le SDK FlatBuffers)
+_HOURLY_VARS = [
+    "temperature_2m",           # 0  °C
+    "relative_humidity_2m",     # 1  %
+    "apparent_temperature",     # 2  °C
+    "precipitation",            # 3  mm
+    "wind_speed_10m",           # 4  km/h
+    "shortwave_radiation",      # 5  W/m²  (flux instantané horaire)
+]
+
+# URL archive Open-Meteo (même endpoint que dans fetch_weather_open_meteo Twinity)
+_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Récupération ERA5-Land via SDK openmeteo-requests (FlatBuffers)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_weather_hourly(lat, lon, date_str, timezone="Europe/Paris",
+                         client=None, model="era5_land", date_end=None):
+    """Fetch hourly reanalysis data via openmeteo-requests SDK.
+
+    Utilise le même endpoint archive-api.open-meteo.com que Twinity.
+    Retourne 24 h (ou 48 h si date_end differ) de données horaires :
+    température, humidité, vent, précipitations, rayonnement et WBGT.
+
+    Parameters
+    ----------
+    lat      : float  latitude WGS84 (degrés décimaux)
+    lon      : float  longitude WGS84 (degrés décimaux)
+    date_str : str    date de début 'YYYY-MM-DD'
+    timezone : str    fuseau IANA (défaut : 'Europe/Paris')
+    client   : openmeteo_requests.Client | None
+               Si None, un client temporaire est créé (sans cache).
+               Passer le client global Twinity pour mutualiser.
+    model    : str    modèle de réanalyse (défaut : 'era5_land')
+               'era5_land' : résolution 0.1° (~9 km) — précis en altitude,
+                             peut sous-estimer en zone urbaine dense.
+               'era5'      : résolution 0.25° (~25 km) — parfois plus juste
+                             en plaine et zone péri-urbaine.
+    date_end : str | None  date de fin 'YYYY-MM-DD' (défaut : date_str).
+               Passer la date d'arrivée pour les courses nocturnes
+               franchissant minuit (ex. SaintéLyon : start=2025-11-29,
+               end=2025-11-30). Retourne alors 48 heures de données.
+
+    Returns
+    -------
+    pd.DataFrame  colonnes : time (datetime, UTC), temperature_2m,
+                  relative_humidity_2m, apparent_temperature,
+                  precipitation, wind_speed_10m, shortwave_radiation,
+                  wbgt — ou None en cas d'erreur.
+    """
+    if not _OPENMETEO_AVAILABLE:
+        warnings.warn("openmeteo-requests indisponible — météo ignorée.")
+        return None
+
+    if client is None:
+        client = openmeteo_requests.Client()
+
+    end_str = date_end if date_end is not None else date_str
+
+    params = {
+        "latitude":        lat,
+        "longitude":       lon,
+        "start_date":      date_str,
+        "end_date":        end_str,
+        "hourly":          _HOURLY_VARS,
+        "wind_speed_unit": "kmh",
+        "timezone":        timezone,
+        "models":          model,
+    }
+
+    try:
+        responses = client.weather_api(_ARCHIVE_URL, params=params)
+        r = responses[0]
+        hourly = r.Hourly()
+
+        # Reconstruction du DataFrame depuis le buffer FlatBuffers.
+        # Le SDK retourne toujours des timestamps UTC (secondes epoch).
+        times = pd.date_range(
+            start=pd.to_datetime(hourly.Time(),    unit="s", utc=True),
+            end=pd.to_datetime(hourly.TimeEnd(),   unit="s", utc=True),
+            freq=pd.Timedelta(seconds=hourly.Interval()),
+            inclusive="left",
+        )
+
+        def _safe_var(i):
+            """Extract variable i; return NaN array if unavailable."""
+            try:
+                arr = hourly.Variables(i).ValuesAsNumpy()
+                return arr if arr is not None else np.full(len(times), np.nan)
+            except Exception:
+                return np.full(len(times), np.nan)
+
+        df_w = pd.DataFrame({
+            "time":                   times,
+            "temperature_2m":         _safe_var(0),
+            "relative_humidity_2m":   _safe_var(1),
+            "apparent_temperature":   _safe_var(2),
+            "precipitation":          _safe_var(3),
+            "wind_speed_10m":         _safe_var(4),
+            "shortwave_radiation":    _safe_var(5),
+        })
+
+        # Remplacer les sentinelles -9999 du SDK par NaN
+        for col in df_w.columns:
+            if col == "time":
+                continue
+            df_w[col] = pd.to_numeric(df_w[col], errors="coerce")
+            df_w.loc[df_w[col] < -999, col] = np.nan
+
+
+        return df_w
+
+    except Exception as exc:
+        warnings.warn(f"Open-Meteo SDK error ({date_str}→{end_str}) : {exc}")
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Interpolation sur le DataFrame GPS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def enrich_df_with_weather(df, df_weather):
+    """Interpolate hourly weather onto the per-second GPS DataFrame.
+
+    Aligne sur les timestamps GPS via interpolation linéaire.
+    Ajoute les colonnes : temp_api, humidity_api, wind_kmh_api,
+    precip_api, solar_rad_api, apparent_temp_api, wbgt_api.
+
+    Parameters
+    ----------
+    df         : GPS DataFrame avec colonne 'timestamp'.
+    df_weather : DataFrame issu de fetch_weather_hourly().
+
+    Returns
+    -------
+    df  enrichi, inchangé si df_weather est None.
+    """
+    if df_weather is None or df_weather.empty:
+        warnings.warn("Données météo indisponibles — enrichissement ignoré.")
+        return df
+
+    df = df.copy()
+
+    # Timestamps en secondes epoch pour np.interp
+    t_w = df_weather["time"].astype("int64").to_numpy() // 10**9
+
+    ts = df["timestamp"].copy()
+    if hasattr(ts.dt, "tz") and ts.dt.tz is not None:
+        ts = ts.dt.tz_convert("UTC").dt.tz_localize(None)
+    t_gps = ts.astype("int64").to_numpy() // 10**9
+
+    col_map = {
+        "temperature_2m":       "temp_api",
+        "relative_humidity_2m": "humidity_api",
+        "wind_speed_10m":       "wind_kmh_api",
+        "precipitation":        "precip_api",
+        "shortwave_radiation":  "solar_rad_api",
+        "apparent_temperature": "apparent_temp_api",
+        "wbgt":                 "wbgt_api",
+    }
+
+    for src, dst in col_map.items():
+        if src in df_weather.columns:
+            df[dst] = np.interp(
+                t_gps,
+                t_w,
+                df_weather[src].to_numpy(dtype=float),
+            )
+        else:
+            df[dst] = np.nan
+
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Visualisation méteo le long de la course
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_weather_along_race(df, ravito_km, ravito_nom, fc_max=None,
+                            show_watch_temp=False):
+    """Plot weather variables along the race (distance axis).
+
+    Deux panneaux :
+      1. Température ERA5-Land + ressentie (montre optionnelle)
+      2. Humidité (%) et vent (km/h) 
+
+    La température montre est désactivée par défaut (show_watch_temp=False)
+    car biaisée +2 à +5°C par la chaleur corporelle. Activer uniquement
+    pour comparer la dynamique temporelle, pas les valeurs absolues.
+
+    Parameters
+    ----------
+    df              : DataFrame enriched with enrich_df_with_weather().
+    ravito_km       : list of float.
+    ravito_nom      : list of str.
+    fc_max          : float | None  (conservé pour homogénéité API)
+    show_watch_temp : bool  afficher la courbe montre (défaut False).
+    """
+    x_km = df["dist_m"] / 1000.0
+    has_watch = (show_watch_temp
+                 and "temperature" in df.columns
+                 and df["temperature"].notna().sum() > 100)
+    has_api   = ("temp_api" in df.columns
+                 and df["temp_api"].notna().sum() > 10)
+
+    if not has_watch and not has_api:
+        print("Aucune donnée de température disponible.")
+        return
+
+    def _add_ravitos(ax):
+        for km, nom in zip(ravito_km, ravito_nom):
+            ax.axvline(km, color="grey", linestyle=":", alpha=0.9, linewidth=1)
+            ylim = ax.get_ylim()
+            ax.text(km, ylim[1], nom, fontsize=7, rotation=90,
+                    va="top", ha="right", color="grey")
+
+    n_panels = 2 if has_api else 1
+    fig, axes = plt.subplots(n_panels, 1,
+                             figsize=(13, 4 * n_panels), sharex=True)
+    if n_panels == 1:
+        axes = [axes]
+
+    # ── Panel 1 : températures ───────────────────────────────────────────────
+    ax0 = axes[0]
+
+    if has_api:
+        ax0.plot(x_km, df["temp_api"], color="steelblue", linewidth=1.8,
+                 label="ERA5-Land (réanalyse, ~9 km)")
+        if "apparent_temp_api" in df.columns:
+            ax0.plot(x_km, df["apparent_temp_api"],
+                     color="navy", linewidth=0.9, alpha=0.5,
+                     linestyle=":", label="Température ressentie")
+
+    if has_watch:
+        win = max(10, int(3000 / df["dist_m"].diff().median()))
+        t_smooth = (df["temperature"]
+                    .rolling(win, center=True, min_periods=5)
+                    .median())
+        ax0.plot(x_km, t_smooth, color="tomato", linewidth=1.2,
+                 alpha=0.6, linestyle="--",
+                 label="Montre lissée - biais +2–5°C (non fiable en absolu)")
+
+    title = "Température au fil de la course — ERA5-Land (Muñoz Sabater 2019)"
+    if has_watch:
+        title += " + montre (indicatif)"
+    ax0.set_ylabel("Température (°C)")
+    ax0.set_title(title)
+    ax0.legend(fontsize=8)
+    ax0.grid(True, alpha=0.4)
+    _add_ravitos(ax0)
+
+    if not has_api:
+        axes[-1].set_xlabel("Distance (km)")
+        fig.tight_layout()
+        plt.show()
+        return
+
+    # ── Panel 2 : humidité + vent ────────────────────────────────────────────
+    ax1 = axes[1]
+    if "humidity_api" in df.columns:
+        ax1.plot(x_km, df["humidity_api"], color="teal", linewidth=1.4,
+                 label="Humidité relative (%)")
+        ax1.set_ylabel("Humidité (%)")
+
+    ax1b = ax1.twinx()
+    if "wind_kmh_api" in df.columns:
+        ax1b.plot(x_km, df["wind_kmh_api"], color="goldenrod",
+                  linewidth=1.2, alpha=0.7, label="Vent (km/h)")
+        ax1b.set_ylabel("Vent (km/h)", color="goldenrod")
+        ax1b.tick_params(axis="y", labelcolor="goldenrod")
+
+    ax1.set_title("Humidité relative et vent (ERA5-Land)")
+    ax1.legend(fontsize=8, loc="upper left")
+    ax1b.legend(fontsize=8, loc="upper right")
+    ax1.grid(True, alpha=0.7)
+    _add_ravitos(ax1)
+
+    axes[-1].set_xlabel("Distance (km)")
+    fig.tight_layout()
+    plt.show()
+
+    # ── Tableau résumé ───────────────────────────────────────────────────────
+    print("\n── Météo ERA5-Land pendant la course ───────────────────────────")
+    print(f"Température     : min {df['temp_api'].min():.1f}°C "
+          f"/ moy {df['temp_api'].mean():.1f}°C "
+          f"/ max {df['temp_api'].max():.1f}°C")
+    if "humidity_api" in df.columns:
+        print(f"Humidité        : moy {df['humidity_api'].mean():.0f}%")
+    if "wind_kmh_api" in df.columns:
+        print(f"Vent            : moy {df['wind_kmh_api'].mean():.1f} km/h "
+              f"/ max {df['wind_kmh_api'].max():.1f} km/h")
+    if "solar_rad_api" in df.columns:
+        sr_moy = df["solar_rad_api"].dropna()
+        if not sr_moy.empty:
+            print(f"Rayonnement     : moy {sr_moy.mean():.0f} W/m²")
 
