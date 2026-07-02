@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trail-lab"
+version = "0.1.0"
+description = "Trail running research notebooks"
+requires-python = ">=3.10"
+dependencies = [
+    "twinity-core @ file:///home/gsainton/01_CODES/twinity-core",
+    "jupyter",
+    "plotly",
+    "ipywidgets",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = []

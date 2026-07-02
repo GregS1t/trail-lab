@@ -1,13 +1,11 @@
-
-# Ignore cache files and directories
-.ipynb_checkpoints/
-*.pyc
 __pycache__/
-
-# Ignore data files
-data/
+*.pyc
+*.db
+*.fit
+*.html
+*.pdf
+assets/
+reports/
+*.egg-info/
+.env
 perso/
-
-# Ignore output files
-output/
-
