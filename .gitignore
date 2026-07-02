@@ -9,3 +9,5 @@ reports/
 *.egg-info/
 .env
 perso/
+trail_lab.egg-info/
+perso/
